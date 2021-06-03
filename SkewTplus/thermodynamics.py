@@ -74,6 +74,7 @@ def parcelAnalysis(
     tolerance=0.1,
     maxIterations=20,
     depth=30000,
+    mixing_depth=1e4
 ):
     """
     Function to perform a parcel analysis
@@ -162,6 +163,7 @@ def parcelAnalysis(
         maxIterations=maxIterations,
         useVirtual=useVirtual,
         depth=depth,
+        mixing_depth=mixing_depth
     )
 
     if pressure.ndim == 4:

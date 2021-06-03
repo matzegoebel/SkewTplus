@@ -326,7 +326,8 @@ def _parcelAnalysis4D(float32[:, :, :, :] pressure,
                       float32 tolerance=0.1,
                       int useVirtual=1,
                       int maxIterations=20,
-                      float32 depth=30000):
+                      float32 depth=30000,
+                      float32 mixing_depth=1e4):
     """
     Function to perform a parcel analysis over a 3D + time domain.
     
@@ -398,8 +399,9 @@ def _parcelAnalysis4D(float32[:, :, :, :] pressure,
                                                          useVirtual=useVirtual,
                                                          method=method,
                                                          depth=depth,
-                                                         initialLevel=initialLevel)
-        
+                                                         initialLevel=initialLevel,
+                                                         mixing_depth=mixing_depth)
+
                     if myParcelAnalysis.error > 0:
                         with gil:
                             raise fatalError("Error during Parcel Analysis",
@@ -448,7 +450,8 @@ def _parcelAnalysis3D(float32[:, :, :] pressure,
                       int initialLevel=0,
                       float32 tolerance=0.1,
                       int maxIterations=20,
-                      float32 depth=30000):
+                      float32 depth=30000,
+                      float32 mixing_depth=1e4):
     """
     Function to perform a parcel analysis over a 3D domain (at a single time)
     
@@ -515,7 +518,8 @@ def _parcelAnalysis3D(float32[:, :, :] pressure,
                                                      useVirtual=useVirtual,
                                                      tolerance=tolerance,
                                                      maxIterations=maxIterations,
-                                                     depth=depth)
+                                                     depth=depth,
+                                                     mixing_depth=mixing_depth)
                 if myParcelAnalysis.error > 0:
                     with gil:
                         raise fatalError("Error during Parcel Analysis",
@@ -565,7 +569,8 @@ def _parcelAnalysis1D(float32[:] pressure,
                       int useVirtual=1,
                       float32 tolerance=0.1,
                       int maxIterations=20,
-                      float32 depth=30000):
+                      float32 depth=30000,
+                      float32 mixing_depth=1e4):
     """
     Function to perform a parcel analysis for a vertical sounding (1D)
     
@@ -607,9 +612,9 @@ def _parcelAnalysis1D(float32[:] pressure,
     
         * Most Unstable  : method=0
         * Single Parcel: method=1
-        * Mixed Layer  : method=2 (Not supported yet)
-             
-         
+        * Mixed Layer  : method=2
+
+
     fullFields : bool, optional
         If False return only CAPE and CIN values. Otherwise temperature
         and pressure in the Lifting Condensation Level(LCL), the Level of
@@ -635,9 +640,10 @@ def _parcelAnalysis1D(float32[:] pressure,
         
     depth :  float32, optional
         Maximum depth in Pascals used to find the most unstable parcel.
-         
-        
-        
+
+    mixing_depth : float32, optional
+        Mixing depth in Pascals to use for method=2 (Mixed Layer)
+
     Returns
     -------
         
@@ -677,12 +683,13 @@ def _parcelAnalysis1D(float32[:] pressure,
                                                 useVirtual=useVirtual,
                                                 method=method,
                                                 depth=depth,
-                                                initialLevel=initialLevel)
+                                                initialLevel=initialLevel,
+                                                mixing_depth=mixing_depth)
 
-    
-    
-        
-        
+
+
+
+
     if fullFields:
         outputDict = dict(temperatureAtLCL=myParcelAnalysisOutput.temperatureAtLCL,
                           pressureAtLCL=myParcelAnalysisOutput.pressureAtLCL,
@@ -711,7 +718,8 @@ cdef parcelAnalysisOutput __parcelAnalysis1D(float32[:] pressure,
                                              int useVirtual=0,
                                              float32 tolerance=0.1,
                                              int maxIterations=20,
-                                             float32 depth=30000) nogil:                                            
+                                             float32 depth=30000,
+                                             float32 mixing_depth=1e4) nogil:
     """
     Cython function used to perform a parcel analysis for a vertical sounding (1D).
 
@@ -779,7 +787,8 @@ cdef parcelAnalysisOutput __parcelAnalysis1D(float32[:] pressure,
             
         # printf("P(%d)=%.1f\n",MU_Level,pressure[MU_Level]/100)
     else:
-
+        if method != 2:
+            mixing_depth = 0
         myParcelAnalysisOutput = _singleParcelAnalysis1D(pressure,
                                                          temperature,
                                                          dewPointTemperature,
@@ -787,7 +796,9 @@ cdef parcelAnalysisOutput __parcelAnalysis1D(float32[:] pressure,
                                                          maxIterations=maxIterations,
                                                          useVirtual=useVirtual,
                                                          maxPressureStep=maxPressureStep,
-                                                         initialLevel=initialLevel)
+                                                         initialLevel=initialLevel,
+                                                         mixing_depth=mixing_depth)
+
 
     
     return  myParcelAnalysisOutput
@@ -802,7 +813,8 @@ cdef parcelAnalysisOutput _singleParcelAnalysis1D(float32[:] pressure,
                                                   int maxIterations=20,
                                                   int useVirtual = 0,
                                                   float32 tolerance=0.1,
-                                                  int initialLevel=0) nogil:  
+                                                  int initialLevel=0,
+                                                  float32 mixing_depth=1e4) nogil:
     """
     Cython function used to perform a single parcel analysis
     
@@ -835,11 +847,40 @@ cdef parcelAnalysisOutput _singleParcelAnalysis1D(float32[:] pressure,
     
     cdef int level = 0, next_level_LCL = numberOfLevels - 1  # next level after LCL
     cdef int lastLevel = numberOfLevels - 1  # Last level
-    
-    cdef float32 initialTemperature = temperature[initialLevel]
+
     cdef float32 initialPressure = pressure[initialLevel]
+    cdef float32 weight
+    cdef float32 weight_sum = 0
+    cdef float32 theta
+    cdef float32 p
+    cdef float32 qv
+    cdef float32 initialTheta = 0
+    cdef float32 initialTemperature
     cdef float32 initialDewPointTemperature = dewPointTemperature[initialLevel]
-    
+    cdef float32 initialMixingRatio = 0
+
+    if mixing_depth > 0:
+        # mix theta and qv by averaging with pressure difference as weights
+        p = initialPressure
+        level = initialLevel
+        while p > initialPressure - mixing_depth:
+            weight = pressure[level] - pressure[level + 1]
+            theta = temperature[level]*(1e5/pressure[level])**Rs_ov_Cp_da
+            initialTheta += weight * theta
+            qv = _vaporMixingRatio(_waterSatVaporPressureBolton(dewPointTemperature[level]),
+                                   pressure[level])
+            initialMixingRatio += weight * qv
+            weight_sum += weight
+            level += 1
+            p = pressure[level]
+
+        initialTheta /= weight_sum
+        initialTemperature = initialTheta*(pressure[initialLevel]/1e5)**Rs_ov_Cp_da
+        initialMixingRatio /= weight_sum
+    else:
+        initialTemperature = temperature[initialLevel]
+        initialMixingRatio = _vaporMixingRatio(_waterSatVaporPressureBolton(initialDewPointTemperature),
+                                               initialPressure)
     if initialLevel >= numberOfLevels - 1:
         output.error = 2
         return output
@@ -857,9 +898,8 @@ cdef parcelAnalysisOutput _singleParcelAnalysis1D(float32[:] pressure,
     
     # # Rough approximation
     cdef float32 J = 0
-    cdef float32 initialMixingRatio = _vaporMixingRatio(_waterSatVaporPressureBolton(initialDewPointTemperature),
-                                                        initialPressure)
-    
+
+
     # TODO: check dew point temp is never higher than the env
     
     cdef bint useBisection = 0
